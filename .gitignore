@@ -1,0 +1,17 @@
+# secrets — never commit (real key lives in ../.env.local, outside this folder)
+.env
+.env.*
+*.key
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# spike / run artifacts
+spike_out/
+output/
+*.log
+tmp/
+*.mp4

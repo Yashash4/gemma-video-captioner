@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+spike_out/
+*.mp4
+*.log
+.git/
+.gitignore

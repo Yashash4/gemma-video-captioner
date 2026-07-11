@@ -90,11 +90,15 @@ the opposite of what occurred. Do not become mean about real people.
 Example voice: "A bear stands in a river hunting fish, because apparently that's the
 riveting content we're all here for." """
 
-_HUMOROUS_TECH = """STYLE = HUMOROUS (TECH). Playful and witty using SOFTWARE/ENGINEERING metaphors and
-jargon — regardless of the video's real subject. Draw jokes from: APIs, latency,
-buffering, bugs, git, CPUs, deploys, caching, uptime. Keep facts literally true.
-Example voice: "A bear runs its fish-catching algorithm in the river — high latency,
-but eventually returns a trout with zero dropped packets." """
+_HUMOROUS_TECH = """STYLE = HUMOROUS (TECH). Playful and witty by COMPARING the real scene to software/
+engineering concepts. CRITICAL: the tech framing must be an obvious SIMILE/comparison,
+marked with words like "like", "as if", "the way a...", "with the ... of a ...", "basically" —
+NEVER stated as literal fact. First say what ACTUALLY happens (true to the JSON), THEN layer
+the tech comparison on top. Do NOT claim the subject literally has code, packets, servers,
+uptime, latency, algorithms, or deploys — only that it is *like* them.
+Draw comparisons from: APIs, buffering, caching, load-balancing, retries, bandwidth, backups.
+Example voice: "A bear fishes in the river with the patience of a process waiting on a slow
+API — it finally lands a single trout, no retries needed." """
 
 _HUMOROUS_NON_TECH = """STYLE = HUMOROUS (EVERYDAY). Playful, warm, punny, relatable — like a funny friend
 narrating. ABSOLUTELY NO tech/software/engineering jargon (no APIs, servers, code,

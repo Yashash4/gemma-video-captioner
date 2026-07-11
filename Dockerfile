@@ -12,16 +12,18 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY *.py ./
 
-# Keys/provider baked at build time:
+# Keys/provider baked at build time (grader runs headless with no env):
 #   docker buildx build --platform linux/amd64 \
-#     --build-arg PROVIDER=fireworks --build-arg FIREWORKS_API_KEY=xxx -t <repo> --push .
+#     --build-arg PROVIDER=ollama --build-arg OLLAMA_API_KEY=xxx -t <repo> --push .
+ARG OLLAMA_API_KEY=""
 ARG GOOGLE_AI_STUDIO_API_KEY=""
 ARG FIREWORKS_API_KEY=""
 ARG PROVIDER=""
-ENV GOOGLE_AI_STUDIO_API_KEY=$GOOGLE_AI_STUDIO_API_KEY \
-    FIREWORKS_API_KEY=$FIREWORKS_API_KEY \
-    PROVIDER=$PROVIDER \
-    PYTHONUNBUFFERED=1
+ENV OLLAMA_API_KEY=$OLLAMA_API_KEY
+ENV GOOGLE_AI_STUDIO_API_KEY=$GOOGLE_AI_STUDIO_API_KEY
+ENV FIREWORKS_API_KEY=$FIREWORKS_API_KEY
+ENV PROVIDER=$PROVIDER
+ENV PYTHONUNBUFFERED=1
 
 # agent.py: reads /input/tasks.json -> writes /output/results.json
 ENTRYPOINT ["python", "agent.py"]

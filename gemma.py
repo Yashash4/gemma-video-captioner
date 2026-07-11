@@ -1,8 +1,12 @@
 """Gemma-4-31B client for the AMD Track-2 captioning agent.
 
-One vision call + text calls through a shared _post() with retry+backoff+jitter
-on the free tier's 503/429/500 throttling. Key comes from the environment first
-(baked into the Docker image), falling back to a local ../.env.local for dev.
+Two providers behind ONE interface (call_vision / call_text), chosen by env PROVIDER
+(or auto: ollama if OLLAMA_API_KEY is present, else google):
+  - "ollama"  -> Ollama Cloud gemma4:31b-cloud. FAST (~1-4s) and `think:false` returns
+                CLEAN output (no reasoning dump) — the dev + graded endpoint.
+  - "google"  -> AI Studio generateContent (free tier; slow + always-thinking). Fallback.
+All calls go through a shared retry+backoff+jitter wrapper for 429/5xx/network throttling.
+Keys come from the environment first (baked into the image), then a dev ../.env.local.
 """
 import json
 import os
@@ -11,19 +15,12 @@ import time
 
 import requests
 
-MODEL = "gemma-4-31b-it"  # 26b-a4b returns HTTP 500 — do not use.
-_ENDPOINT = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
-_HDR = {"Content-Type": "application/json"}
-
-# retry policy: 6 tries, 2s base, exp backoff capped at 30s + up to 2s jitter.
-# (free tier throws sporadic 500s that clear on retry — a 6th shot buys margin.)
+# ---- retry policy (shared) -------------------------------------------------
 _MAX_TRIES = 6
 _BASE = 2.0
 _CAP = 30.0
 _JITTER = 2.0
-_RETRYABLE = (429, 500, 502, 503)
-
-# thread-safe-enough counters for the spike report (GIL-protected int += is fine here).
+_RETRYABLE = (408, 409, 425, 429, 500, 502, 503, 504)
 RETRY_STATS = {"429": 0, "500": 0, "502": 0, "503": 0, "network": 0, "total_retries": 0}
 
 
@@ -33,60 +30,58 @@ def reset_stats():
 
 
 def _bump(key):
-    RETRY_STATS[key] += 1
+    RETRY_STATS[key if key in RETRY_STATS else "500"] += 1
     RETRY_STATS["total_retries"] += 1
 
 
-_key_cache = None
+# ---- env / key resolution (env first, then repo-root ../.env.local) --------
+_env_cache = {}
 
 
-def _get_key():
-    global _key_cache
-    if _key_cache:
-        return _key_cache
-    k = os.environ.get("GOOGLE_AI_STUDIO_API_KEY")
-    if not k:
-        # dev fallback: walk up from this file looking for .env.local (lives in repo root, outside code/)
+def _env(name):
+    if name in _env_cache:
+        return _env_cache[name]
+    v = os.environ.get(name)
+    if not v:
         d = os.path.dirname(os.path.abspath(__file__))
         for _ in range(6):
             p = os.path.join(d, ".env.local")
             if os.path.exists(p):
-                with open(p, encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line.startswith("GOOGLE_AI_STUDIO_API_KEY="):
-                            k = line.split("=", 1)[1].strip()
-                            break
-            if k or d == os.path.dirname(d):
+                for line in open(p, encoding="utf-8"):
+                    line = line.strip()
+                    if line.startswith(name + "="):
+                        v = line.split("=", 1)[1].strip()
+                        break
+            if v or d == os.path.dirname(d):
                 break
             d = os.path.dirname(d)
-    if not k:
-        raise RuntimeError("GOOGLE_AI_STUDIO_API_KEY not set and no .env.local found")
-    _key_cache = k
-    return k
+    _env_cache[name] = v
+    return v
 
 
-def _post(parts, timeout=30):
-    """POST one generateContent call; retry retryable statuses / network errors.
+def _provider():
+    p = _env("PROVIDER")
+    if p:
+        return p.strip().lower()
+    return "ollama" if _env("OLLAMA_API_KEY") else "google"
 
-    Raises the last error after _MAX_TRIES (caller decides whether to degrade).
-    """
-    url = f"{_ENDPOINT}?key={_get_key()}"
-    body = {"contents": [{"parts": parts}]}
+
+# ---- shared retry wrapper --------------------------------------------------
+def _with_retry(do_request, timeout):
+    """do_request() -> (status_or_None, text_or_None, exc_or_None). Retries retryable
+    HTTP statuses and network errors; returns the parsed text or raises the last error."""
     last = None
     for attempt in range(_MAX_TRIES):
         retryable = False
         try:
-            r = requests.post(url, json=body, headers=_HDR, timeout=timeout)
-            if r.status_code == 200:
-                cands = r.json().get("candidates") or []
-                if not cands:
-                    # safety block / empty completion — surface it, don't loop.
-                    raise RuntimeError("no candidates (safety block/empty): " + json.dumps(r.json())[:300])
-                return cands[0]["content"]["parts"][0]["text"]
-            last = RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
-            if r.status_code in _RETRYABLE:
-                _bump(str(r.status_code) if str(r.status_code) in RETRY_STATS else "500")
+            status, text, err = do_request()
+            if err is None and status == 200:
+                return text
+            if err is not None:
+                raise err
+            last = RuntimeError(f"HTTP {status}: {str(text)[:200]}")
+            if status in _RETRYABLE:
+                _bump(str(status))
                 retryable = True
         except requests.RequestException as e:
             last = e
@@ -98,20 +93,73 @@ def _post(parts, timeout=30):
     raise last
 
 
-def call_vision(prompt, frames_b64, timeout=30):
+# ---- Ollama Cloud provider -------------------------------------------------
+_OLLAMA_URL = "https://ollama.com/api/chat"
+
+
+def _ollama(prompt, images_b64, timeout, temperature):
+    model = _env("OLLAMA_MODEL") or "gemma4:31b-cloud"
+    msg = {"role": "user", "content": prompt}
+    if images_b64:
+        msg["images"] = list(images_b64)
+    body = {"model": model, "messages": [msg], "stream": False, "think": False}
+    if temperature is not None:
+        body["options"] = {"temperature": temperature}
+    hdr = {"Authorization": f"Bearer {_env('OLLAMA_API_KEY')}", "Content-Type": "application/json"}
+
+    def do():
+        r = requests.post(_OLLAMA_URL, json=body, headers=hdr, timeout=timeout)
+        if r.status_code != 200:
+            return r.status_code, r.text, None
+        content = ((r.json().get("message") or {}).get("content") or "").strip()
+        if not content:
+            return None, None, RuntimeError("empty ollama content: " + json.dumps(r.json())[:300])
+        return 200, content, None
+
+    return _with_retry(do, timeout)
+
+
+# ---- Google AI Studio provider (fallback) ----------------------------------
+_G_MODEL = "gemma-4-31b-it"  # 26b-a4b returns HTTP 500 — do not use.
+_G_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{_G_MODEL}:generateContent"
+
+
+def _google(prompt, images_b64, timeout, temperature):
+    parts = [{"text": prompt}] + [{"inlineData": {"mimeType": "image/jpeg", "data": b}} for b in (images_b64 or [])]
+    body = {"contents": [{"parts": parts}]}
+    if temperature is not None:
+        body["generationConfig"] = {"temperature": temperature}
+    url = f"{_G_URL}?key={_env('GOOGLE_AI_STUDIO_API_KEY')}"
+
+    def do():
+        r = requests.post(url, json=body, headers={"Content-Type": "application/json"}, timeout=timeout)
+        if r.status_code != 200:
+            return r.status_code, r.text, None
+        cands = r.json().get("candidates") or []
+        if not cands:
+            return None, None, RuntimeError("no candidates (safety block/empty): " + json.dumps(r.json())[:300])
+        return 200, cands[0]["content"]["parts"][0]["text"], None
+
+    return _with_retry(do, timeout)
+
+
+def _dispatch(prompt, images_b64, timeout, temperature):
+    return (_ollama if _provider() == "ollama" else _google)(prompt, images_b64, timeout, temperature)
+
+
+# ---- public interface ------------------------------------------------------
+def call_vision(prompt, frames_b64, timeout=60, temperature=None):
     """One multimodal call: text prompt + N JPEG frames (base64). Returns text."""
-    parts = [{"text": prompt}]
-    parts += [{"inlineData": {"mimeType": "image/jpeg", "data": b}} for b in frames_b64]
-    return _post(parts, timeout=timeout)
+    return _dispatch(prompt, frames_b64, timeout, temperature)
 
 
-def call_text(prompt, timeout=30):
+def call_text(prompt, timeout=60, temperature=None):
     """Text-only call. Returns text."""
-    return _post([{"text": prompt}], timeout=timeout)
+    return _dispatch(prompt, None, timeout, temperature)
 
 
 if __name__ == "__main__":
-    # self-check: the key resolves and a trivial text call comes back non-empty.
+    print("provider:", _provider())
     out = call_text("Reply with exactly the word: OK")
     print("text reply:", repr(out.strip()[:80]))
     assert out.strip(), "empty response"

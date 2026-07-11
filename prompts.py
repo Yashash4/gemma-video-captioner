@@ -6,8 +6,9 @@ wrapped in a STRICT delimiter (<json> / <caption>) with a one-shot format exampl
 pipeline in pipeline.py regenerates when the delimiter is absent. Text only here — the
 parsing/regeneration logic lives in pipeline.py.
 
-Style templates are verbatim from docs/51-TRACK2-PIPELINE.md §4 (incl. their example
-voices); the grounding + self-check + accuracy prompts are from §5.
+Style templates are tuned to the organizers' released reference captions (short, confident,
+witty, specific; bold tech humor for humorous_tech, jargon-free everyday humor for
+humorous_non_tech); the grounding + self-check prompts are from docs/51 §5.
 """
 
 # ----------------------------------------------------------------------------
@@ -56,13 +57,16 @@ Keep the same keys. Output ONLY the cleaned object wrapped in <json></json>, not
 # Stage B — styling. Shared preamble (§4, verbatim) + strict <caption> delimiter.
 # ----------------------------------------------------------------------------
 PREAMBLE = """You write ONE English caption for a video, given a verified JSON description of what
-the video contains. HARD RULES:
-- Use ONLY facts present in the JSON. Do not invent people, places, objects, numbers,
-  brands, or events. If the JSON marks something "uncertain", do not assert it.
-- Every factual claim in your caption must stay literally TRUE. The STYLE lives in
-  tone, word choice, and framing — never in fabricated events. A joke that changes
-  what happened is a wrong caption.
-- 1-2 full sentences, ~12-40 words. No hashtags, no emojis, no preamble, no quotes.
+the video contains. RULES:
+- Ground the caption in the REAL scene: the subjects, actions, and setting in the JSON must
+  stay recognizable. Do NOT invent real people, places, objects, numbers, brands, or events
+  that are not in the JSON. If the JSON marks something "uncertain", do not assert it as fact.
+- A clearly-figurative joke, metaphor, or comparison is EXPECTED humor, not a fabrication —
+  framing the real scene through a witty lens is good. What is wrong is claiming a literal
+  thing happened that didn't (a person, object, or action that isn't there).
+- Be CONCISE, CONFIDENT, WITTY and SPECIFIC — anchor to a concrete detail of THIS video,
+  never a generic template. Prefer ONE punchy sentence; sarcastic/humor styles may use up to
+  2-3 short sentences. ~8-40 words. No hashtags, no emojis, no preamble, no quotes.
 
 OUTPUT: reply with ONLY the finished caption wrapped in <caption></caption> — a real,
 complete sentence. No reasoning, no drafts, no notes, no placeholders, no backticks.
@@ -78,34 +82,37 @@ CAPTION_RETRY = ("\n\nYour previous reply was NOT a valid caption (it was empty,
                  "a placeholder, or it contained reasoning/backticks). Reply with ONLY one real, "
                  "complete sentence describing the video, wrapped in <caption></caption>, and nothing else.")
 
-# §4 style blocks — verbatim, each with its one-line example voice.
-_FORMAL = """STYLE = FORMAL. Neutral, precise, documentary register. Third person. No contractions,
-no slang, no jokes, no opinion. Describe what occurs plainly and objectively, as a
-museum label or news caption would.
-Example voice: "A brown bear wades through a shallow river, pausing to search the current for fish." """
+# Style blocks — tuned to the organizers' reference voice: short, confident, witty, specific.
+_FORMAL = """STYLE = FORMAL. Clear, precise, professional — a documentary or news caption. Third
+person, neutral, objective. ONE well-formed sentence naming the concrete subject, action,
+and setting. No contractions, no slang, no jokes, no opinion, no metaphor.
+Example voice: "A young orange tabby kitten sits among dense green foliage in an outdoor
+setting, looking directly at the camera with an alert and curious expression." """
 
-_SARCASTIC = """STYLE = SARCASTIC. Dry, ironic, deadpan, faux-unimpressed. Understate or mock-overhype
-what happens. The facts stay 100% true — the sarcasm is in the attitude, NOT in claiming
-the opposite of what occurred. Do not become mean about real people.
-Example voice: "A bear stands in a river hunting fish, because apparently that's the
-riveting content we're all here for." """
+_SARCASTIC = """STYLE = SARCASTIC. One dry, deadpan, witty line that pokes fun at the scene while every
+stated fact stays TRUE. Understate or mock-overhype what actually happens — the irony is in
+the attitude, NEVER in claiming the opposite of reality. Confident and specific; do not become
+mean about real people. Vary your wording — do not lean on a stock hype word like "thrilling".
+Example voice: "A person at a computer, apparently working, which is exactly what someone
+would do if they were not working." """
 
-_HUMOROUS_TECH = """STYLE = HUMOROUS (TECH). Playful and witty by COMPARING the real scene to software/
-engineering concepts. CRITICAL: the tech framing must be an obvious SIMILE/comparison,
-marked with words like "like", "as if", "the way a...", "with the ... of a ...", "basically" —
-NEVER stated as literal fact. First say what ACTUALLY happens (true to the JSON), THEN layer
-the tech comparison on top. Do NOT claim the subject literally has code, packets, servers,
-uptime, latency, algorithms, or deploys — only that it is *like* them.
-Draw comparisons from: APIs, buffering, caching, load-balancing, retries, bandwidth, backups.
-Example voice: "A bear fishes in the river with the patience of a process waiting on a slow
-API — it finally lands a single trout, no retries needed." """
+_HUMOROUS_TECH = """STYLE = HUMOROUS (TECH). One or two PUNCHY lines that reframe the REAL scene through bold
+software/engineering humor, stated CONFIDENTLY as the joke — NOT hedged with "like" or "as if".
+Lean into: deployments, rollbacks, breaking changes, bugs, the stack trace, dev vs prod, merge
+conflicts, refactoring, uptime, shipping to production. The metaphor IS the humor; keep it
+anchored to a CONCRETE detail from the JSON — name the actual subject/object/action (the kitten,
+the zucchini, the waves), never a generic word like "landscape", "scene", or "environment".
+Do not invent a new literal object or person that isn't there.
+Example voice: "Nature's annual deployment: all leaf nodes updated to yellow simultaneously,
+no breaking changes reported." """
 
-_HUMOROUS_NON_TECH = """STYLE = HUMOROUS (EVERYDAY). Playful, warm, punny, relatable — like a funny friend
-narrating. ABSOLUTELY NO tech/software/engineering jargon (no APIs, servers, code,
-latency, bugs). Draw jokes from everyday life, food, relationships, weather. Keep facts
-literally true.
-Example voice: "This bear is treating the river like an all-you-can-eat sushi bar, and
-honestly, respect the commitment." """
+_HUMOROUS_NON_TECH = """STYLE = HUMOROUS (EVERYDAY). One or two warm, funny, relatable lines — like a witty friend
+narrating. ABSOLUTELY NO tech, software, engineering, or internet words (no code, apps, servers,
+deploys, bugs, latency, algorithms, uploads/downloads, wifi, online). Draw the joke ONLY from
+everyday life: food, chores, weather, relationships, moods, effort. Confident and specific to
+THIS scene.
+Example voice: "A woman at a computer, visibly handling something extremely important that will
+be completely forgotten by Thursday." """
 
 _STYLE_BLOCKS = {
     "formal": _FORMAL,
@@ -145,19 +152,26 @@ def self_check(facts_json):
 # ----------------------------------------------------------------------------
 # D2 — self-eval accuracy pass. ONE batched call over ALL captions (§6 / §5.2).
 # ----------------------------------------------------------------------------
-ACCURACY_EVAL = """You are checking captions for factual grounding against VERIFIED facts about a
-video. A caption FAILS if it asserts any person, object, action, place, brand, number, or
-event NOT supported by the facts (anything listed under "uncertain" counts as NOT supported).
-Tone, humor, and sarcasm are fine as long as every stated fact stays true.
+ACCURACY_EVAL = """You are checking video captions for MAJOR hallucinations against VERIFIED facts about
+a video. A caption FAILS only if it asserts a real, LITERAL thing that is NOT in the facts —
+an invented person, object, place, action, brand, or specific number that a viewer would take
+as a factual claim about the scene (anything listed under "uncertain" counts as NOT supported).
+
+NOT a failure (do NOT flag these): jokes, sarcasm, hyperbole, and clearly-figurative
+software/engineering or everyday-life METAPHORS. A caption may confidently frame the real scene
+through a witty lens (e.g. calling autumn leaves a "deployment", or a kitten an "autonomous
+agent") — that is intended STYLE, not a hallucination, as long as the real subject, action, and
+setting stay recognizable.
 
 FACTS: <<JSON>>
 
 CAPTIONS:
 <<CAPS>>
 
-List ONLY the labels of captions that fail. Output ONE JSON object wrapped in <json></json>:
+List ONLY the labels of captions that fail (invent a literal, real detail not in the facts).
+Output ONE JSON object wrapped in <json></json>:
 <json>{"failed": ["label", ...]}</json>
-If every caption is grounded, output <json>{"failed": []}</json>. No other text."""
+If every caption is acceptable, output <json>{"failed": []}</json>. No other text."""
 
 
 def accuracy_eval(facts_json, labeled_caps):

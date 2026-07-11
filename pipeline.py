@@ -94,8 +94,8 @@ def _postprocess(cap):
     cap = re.sub(r"\s{2,}", " ", cap).strip()
     cap = cap.strip("\"'“”‘’").strip()
     parts = _SENT.split(cap)
-    if len(parts) > 2:
-        cap = " ".join(parts[:2])
+    if len(parts) > 3:                    # allow up to 3 short punchy sentences (reference humor voice)
+        cap = " ".join(parts[:3])
     return cap.strip()
 
 

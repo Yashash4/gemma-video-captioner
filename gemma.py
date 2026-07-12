@@ -16,10 +16,13 @@ import time
 import requests
 
 # ---- retry policy (shared) -------------------------------------------------
-_MAX_TRIES = 6
-_BASE = 2.0
-_CAP = 30.0
-_JITTER = 2.0
+# Bounded backoff: this is a ~30s-gated real-time path, so a transient 429 must cost ~1-3s,
+# NOT the 16-18s the old exp-backoff hit on later attempts (that alone blew the latency gate).
+# Sleeps: ~1-2, 2-3, 4-5, then capped ~5-6s. Still backs off; just can't sink a clip.
+_MAX_TRIES = 5
+_BASE = 1.0
+_CAP = 5.0
+_JITTER = 1.0
 _RETRYABLE = (408, 409, 425, 429, 500, 502, 503, 504)
 RETRY_STATS = {"429": 0, "500": 0, "502": 0, "503": 0, "network": 0, "total_retries": 0}
 

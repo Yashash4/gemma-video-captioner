@@ -9,13 +9,22 @@ captioning per clip; this file's whole job is to be UNKILLABLE around it:
   * a global time budget guarantees results.json is COMPLETE and on disk before
     the 10-min hard cap (partial-but-complete beats timed-out-and-empty).
 
+Clips are processed CONCURRENTLY (MAX_CLIPS at a time) so a late clip lands seconds
+into the run, not minutes — the latency gate measures each clip's completion from run
+START, so serial processing would push tail clips past ~30s -> graded as the placeholder.
+results.json is PRE-SEEDED with a complete fallback for every task and rewritten
+atomically each time a clip upgrades its entry, so the file is always complete and every
+task_id already has a valid caption on disk before its real one lands.
+
 The fallback text is reused from pipeline._fallback (the same grounded, per-style,
 never-a-fragment captions the pipeline itself emits) — never re-implemented here.
 """
 import json
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pipeline
 
@@ -23,10 +32,17 @@ import pipeline
 INPUT_DIR = os.environ.get("INPUT_DIR", "/input")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/output")
 # stop STARTING model work at this elapsed second, leaving tail room under the 10-min
-# (600s) hard cap for the in-flight clip to finish + the file write. Checked between
-# tasks (not preemptive) — ponytail: a running caption_video can't be interrupted, so
+# (600s) hard cap for the in-flight clip to finish + the file write. Checked before each
+# task STARTS (not preemptive) — ponytail: a running caption_video can't be interrupted, so
 # keep the budget comfortably below 600 (default 570); tune per measured per-clip time.
 TIME_BUDGET_SEC = float(os.environ.get("TIME_BUDGET_SEC", "570"))
+# Clips processed at once. MEASURED on 8 real clips (see report): pool=2 is the sweet spot.
+#   serial : 231s total, 0x429, first clip @29s     (tail clip lands minutes in)
+#   pool=2 : 144s total, ~1x429, first wave @27-30s  <-- beats the gate, 1.6x faster than serial
+#   pool=3 : ~100s total, 3-13x429, first wave @35-43s (15 concurrent Ollama calls storm 429s
+#            AND contend for CPU/net, pushing even the HEAD clips past 30s -> worse for the gate)
+# So 2 is the largest pool whose first wave still lands < 30s. Env-overridable to retune.
+MAX_CLIPS = int(os.environ.get("MAX_CLIPS", "2"))
 
 
 def load_tasks(input_dir):
@@ -76,28 +92,48 @@ def write_results(output_dir, results):
     return path
 
 
-def run(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR, budget=TIME_BUDGET_SEC):
-    """Caption every task, always producing a complete /output/results.json.
+def _seed(task):
+    """A COMPLETE fallback entry for a task (no model call) — what sits on disk until the
+    real caption lands, and what stays if the clip fails or the budget is spent."""
+    return {"task_id": task.get("task_id"), "captions": fallback_captions(list(task.get("styles") or []))}
 
-    Serial by design (free-tier rate limits — see HANDOFF 'serial Track-2'). The
-    finally-write guarantees the file exists even if loading/looping throws.
+
+def run(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR, budget=TIME_BUDGET_SEC, max_clips=MAX_CLIPS):
+    """Caption every task CONCURRENTLY, always producing a complete /output/results.json.
+
+    results.json is pre-seeded with a fallback for every task and rewritten atomically as
+    each clip upgrades its entry, so it is complete at all times. Clips run max_clips at a
+    time. The finally-write guarantees the file exists even if loading/looping throws.
     """
     os.makedirs(output_dir, exist_ok=True)
     results = []
     try:
         tasks = load_tasks(input_dir)
+        results = [_seed(t) for t in tasks]          # complete-from-first-write
+        lock = threading.Lock()
+
+        def flush():
+            with lock:
+                write_results(output_dir, results)   # atomic; serialized across worker threads
+
+        flush()                                       # every task_id valid on disk before any model call
         start = time.monotonic()
-        for task in tasks:
+
+        def work(i_task):
+            i, task = i_task
+            # budget check happens as this clip is about to START (not preemptive); if spent,
+            # leave the pre-seeded fallback and never call the model.
             if time.monotonic() - start >= budget:
-                # budget spent: fill the rest with the fastest fallback, no model calls,
-                # so the file is COMPLETE (every task, every style) before the hard cap.
-                styles = list(task.get("styles") or [])
-                results.append({"task_id": task.get("task_id"),
-                                "captions": fallback_captions(styles)})
-            else:
-                results.append(caption_task(task))
+                return
+            entry = caption_task(task)                # calls pipeline.caption_video; degrades to fallback
+            results[i] = entry
+            flush()                                   # upgrade this clip's entry as soon as it's ready
+
+        if tasks:
+            with ThreadPoolExecutor(max_workers=max(1, min(max_clips, len(tasks)))) as ex:
+                list(ex.map(work, enumerate(tasks)))
     finally:
-        path = write_results(output_dir, results)
+        path = write_results(output_dir, results)     # always leave a complete file
     return results, path
 
 

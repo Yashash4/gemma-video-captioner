@@ -44,30 +44,41 @@ The agent (`agent.py`) is built to always leave a complete, valid `/output/resul
 - **Per-clip concurrency.** Clips are captioned concurrently with a `ThreadPoolExecutor` sized by `MAX_CLIPS` (default 2), so a multi-clip run fits under the cap even when the provider is congested.
 - **One bad clip never sinks the run.** Each task is wrapped in its own try/except that degrades to the grounded fallback for that clip.
 
-## Build
+## Quick start (pull and run)
 
-Keys are never committed. Because the grader runs the image headless with no environment flags, the provider key and settings are baked at build time through `--build-arg`:
-
-```
-docker buildx build --platform linux/amd64 \
-  --build-arg PROVIDER=fireworks \
-  --build-arg FIREWORKS_API_KEY=<your_key> \
-  --build-arg FIREWORKS_MODEL=accounts/<acct>/deployments/<id> \
-  --build-arg APP_VERSION=v13 \
-  -t ghcr.io/<you>/gemma-video-captioner:v13 --push .
-```
-
-The `<your_key>`, `<acct>`, and `<id>` above are placeholders. Substitute your own values at build time. No key or token is stored in this repository.
-
-## Run
+The published image is public on GitHub Container Registry and **contains no baked keys** (safe to pull). You supply your own provider key at run time. The image is headless: it reads `/input/tasks.json` and writes `/output/results.json`, then exits.
 
 ```
-docker run --rm -v /abs/in:/input -v /abs/out:/output ghcr.io/<you>/gemma-video-captioner:v13
+docker pull ghcr.io/yashash4/gemma-video-captioner:v13
 ```
 
-The container reads `/input/tasks.json` and writes `/output/results.json`.
+**Easiest, with Google AI Studio** (a free-tier key works, and it is vision-capable):
 
-**Input** is a JSON array of task objects (a top-level `{"tasks":[...]}` wrapper is also accepted):
+```
+docker run --rm \
+  -e PROVIDER=google \
+  -e GOOGLE_AI_STUDIO_API_KEY=<your_google_ai_studio_key> \
+  -v /abs/path/in:/input \
+  -v /abs/path/out:/output \
+  ghcr.io/yashash4/gemma-video-captioner:v13
+```
+
+**On a dedicated Fireworks deployment** (what the submitted build used, `PROVIDER=fireworks` is already the image default):
+
+```
+docker run --rm \
+  -e FIREWORKS_API_KEY=<your_fireworks_key> \
+  -e FIREWORKS_MODEL=accounts/<acct>/deployments/<id> \
+  -v /abs/path/in:/input \
+  -v /abs/path/out:/output \
+  ghcr.io/yashash4/gemma-video-captioner:v13
+```
+
+`ollama` (`gemma4:31b-cloud`, `-e PROVIDER=ollama -e OLLAMA_API_KEY=...`) is also supported.
+
+## Input and output
+
+**Input** `/input/tasks.json` is a JSON array of task objects (a top-level `{"tasks":[...]}` wrapper is also accepted):
 
 ```json
 [
@@ -94,6 +105,19 @@ The container reads `/input/tasks.json` and writes `/output/results.json`.
   }
 ]
 ```
+
+## Build from source
+
+Keys are never committed to this repository. To build your own image:
+
+```
+docker buildx build --platform linux/amd64 \
+  --build-arg PROVIDER=fireworks \
+  --build-arg APP_VERSION=v13 \
+  -t ghcr.io/<you>/gemma-video-captioner:v13 --push .
+```
+
+Then run it with your key via `-e`, as in Quick start. For a fully headless image that needs no run-time flags (how the graded build ran), a provider key can instead be baked at build time with `--build-arg FIREWORKS_API_KEY=... --build-arg FIREWORKS_MODEL=...`. That embeds the key in the image, so reserve it for a private registry.
 
 ## Team
 

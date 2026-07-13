@@ -16,13 +16,10 @@ import time
 import requests
 
 # ---- retry policy (shared) -------------------------------------------------
-# Bounded backoff: this is a ~30s-gated real-time path, so a transient 429 must cost ~1-3s,
-# NOT the 16-18s the old exp-backoff hit on later attempts (that alone blew the latency gate).
-# Sleeps: ~1-2, 2-3, 4-5, then capped ~5-6s. Still backs off; just can't sink a clip.
-_MAX_TRIES = 5
-_BASE = 1.0
-_CAP = 5.0
-_JITTER = 1.0
+_MAX_TRIES = 6
+_BASE = 2.0
+_CAP = 30.0
+_JITTER = 2.0
 _RETRYABLE = (408, 409, 425, 429, 500, 502, 503, 504)
 RETRY_STATS = {"429": 0, "500": 0, "502": 0, "503": 0, "network": 0, "total_retries": 0}
 
@@ -100,14 +97,19 @@ def _with_retry(do_request, timeout):
 _OLLAMA_URL = "https://ollama.com/api/chat"
 
 
-def _ollama(prompt, images_b64, timeout, temperature):
+def _ollama(prompt, images_b64, timeout, temperature, system=None):
     model = _env("OLLAMA_MODEL") or "gemma4:31b-cloud"
     msg = {"role": "user", "content": prompt}
     if images_b64:
         msg["images"] = list(images_b64)
-    body = {"model": model, "messages": [msg], "stream": False, "think": False}
+    messages = [{"role": "system", "content": system}, msg] if system else [msg]
+    # Gemma-4's calibrated sampling (top_k 64 / top_p 0.95) — sent ALWAYS, else Ollama
+    # silently uses its own 40/0.9. num_ctx 8192: 10 frames (~2800 img tokens) + the long
+    # prompt exceed Ollama's default 4096, which would SILENTLY truncate frames.
+    options = {"top_k": 64, "top_p": 0.95, "num_ctx": 8192}
     if temperature is not None:
-        body["options"] = {"temperature": temperature}
+        options["temperature"] = temperature
+    body = {"model": model, "messages": messages, "stream": False, "think": False, "options": options}
     hdr = {"Authorization": f"Bearer {_env('OLLAMA_API_KEY')}", "Content-Type": "application/json"}
 
     def do():
@@ -127,7 +129,11 @@ _G_MODEL = "gemma-4-31b-it"  # 26b-a4b returns HTTP 500 — do not use.
 _G_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{_G_MODEL}:generateContent"
 
 
-def _google(prompt, images_b64, timeout, temperature):
+def _google(prompt, images_b64, timeout, temperature, system=None):
+    # AI Studio's Gemma endpoint rejects systemInstruction, so fold the persistent rules
+    # into the prompt text (fallback path only; Ollama is what ships).
+    if system:
+        prompt = system + "\n\n" + prompt
     parts = [{"text": prompt}] + [{"inlineData": {"mimeType": "image/jpeg", "data": b}} for b in (images_b64 or [])]
     body = {"contents": [{"parts": parts}]}
     if temperature is not None:
@@ -146,19 +152,61 @@ def _google(prompt, images_b64, timeout, temperature):
     return _with_retry(do, timeout)
 
 
-def _dispatch(prompt, images_b64, timeout, temperature):
-    return (_ollama if _provider() == "ollama" else _google)(prompt, images_b64, timeout, temperature)
+# ---- Fireworks AI provider (dedicated on-demand; no rate limits) -----------
+# OpenAI-compatible endpoint. Used when PROVIDER=fireworks. FIREWORKS_MODEL is the
+# deployment-specific model string (baked at build once the on-demand deployment exists):
+#   accounts/fireworks/models/gemma-4-31b-it-nvfp4#accounts/<acct>/deployments/<id>
+_FIREWORKS_URL = "https://api.fireworks.ai/inference/v1/chat/completions"
+
+
+def _fireworks(prompt, images_b64, timeout, temperature, system=None):
+    model = _env("FIREWORKS_MODEL") or "accounts/fireworks/models/gemma-4-31b-it-nvfp4"
+    content = [{"type": "text", "text": prompt}]
+    for b in (images_b64 or []):
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b}"}})
+    messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": content}]
+    # Disable Gemma-4's thinking (the Fireworks analog of Ollama's think:false). Without it the
+    # model dumps chain-of-thought into reasoning_content and returns content=null on harder
+    # prompts -> "empty content" -> fallback. enable_thinking=False keeps content populated;
+    # reasoning_effort=none is belt-and-suspenders in case the template kwarg is ignored.
+    body = {"model": model, "messages": messages, "max_tokens": 1024,
+            "chat_template_kwargs": {"enable_thinking": False}, "reasoning_effort": "none"}
+    if temperature is not None:
+        body["temperature"] = temperature
+    hdr = {"Authorization": f"Bearer {_env('FIREWORKS_API_KEY')}", "Content-Type": "application/json"}
+
+    def do():
+        r = requests.post(_FIREWORKS_URL, json=body, headers=hdr, timeout=timeout)
+        if r.status_code != 200:
+            return r.status_code, r.text, None
+        choices = r.json().get("choices") or []
+        if not choices:
+            return None, None, RuntimeError("no choices: " + json.dumps(r.json())[:300])
+        text = ((choices[0].get("message") or {}).get("content") or "").strip()
+        if not text:
+            return None, None, RuntimeError("empty fireworks content: " + json.dumps(r.json())[:300])
+        return 200, text, None
+
+    return _with_retry(do, timeout)
+
+
+_PROVIDERS = {"ollama": _ollama, "google": _google, "fireworks": _fireworks}
+
+
+def _dispatch(prompt, images_b64, timeout, temperature, system=None):
+    return _PROVIDERS.get(_provider(), _google)(prompt, images_b64, timeout, temperature, system)
 
 
 # ---- public interface ------------------------------------------------------
-def call_vision(prompt, frames_b64, timeout=60, temperature=None):
-    """One multimodal call: text prompt + N JPEG frames (base64). Returns text."""
-    return _dispatch(prompt, frames_b64, timeout, temperature)
+def call_vision(prompt, frames_b64, timeout=60, temperature=None, system=None):
+    """One multimodal call: text prompt + N JPEG frames (base64). Returns text.
+    `system` (Gemma-4 native system role) carries the persistent rules."""
+    return _dispatch(prompt, frames_b64, timeout, temperature, system)
 
 
-def call_text(prompt, timeout=60, temperature=None):
-    """Text-only call. Returns text."""
-    return _dispatch(prompt, None, timeout, temperature)
+def call_text(prompt, timeout=60, temperature=None, system=None):
+    """Text-only call. Returns text. `system` = persistent-rules system message."""
+    return _dispatch(prompt, None, timeout, temperature, system)
 
 
 if __name__ == "__main__":
@@ -166,4 +214,9 @@ if __name__ == "__main__":
     out = call_text("Reply with exactly the word: OK")
     print("text reply:", repr(out.strip()[:80]))
     assert out.strip(), "empty response"
+    # system role must be accepted (Gemma-4 native system support)
+    sysout = call_text("What word did your instructions tell you to reply with?",
+                       system="Always reply with exactly one word: PONG")
+    print("system reply:", repr(sysout.strip()[:80]))
+    assert sysout.strip(), "empty response with system message"
     print("gemma.py self-check passed; retries:", RETRY_STATS)

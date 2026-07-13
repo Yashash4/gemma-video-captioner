@@ -1,7 +1,8 @@
-__pycache__/
+.git
+.env
+.env.local
+__pycache__
 *.pyc
-spike_out/
 *.mp4
-*.log
-.git/
-.gitignore
+samples/
+spike_out/

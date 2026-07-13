@@ -1,188 +1,100 @@
-<div align="center">
+# Gemma Video Captioner
 
-# Four voices, one truth: a Gemma-4 video captioning agent
+A Google Gemma-4-31B agent that captions any video in four styles (`formal`, `sarcastic`, `humorous_tech`, `humorous_non_tech`), grounded so the humor stays true to what is on screen.
 
-**Every clip, captioned in four distinct styles (formal, sarcastic, humorous-tech,
-humorous-non-tech), all grounded in ONE verified pass over the video, so the jokes never
-lie about what happened. Powered end-to-end by Google Gemma-4-31B.**
+## See once, style four times
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-f59e0b.svg)](./LICENSE)
-[![Track 2](https://img.shields.io/badge/AMD%20ACT%20II-Track%202%20·%20Video%20Captioning-b45309.svg)](https://lablab.ai/)
-[![Powered by Gemma-4-31B](https://img.shields.io/badge/Powered%20by-Gemma--4--31B-16a34a.svg)](https://ai.google.dev/gemma)
+The core idea is that the accuracy-critical work of *seeing* happens exactly once. A single vision pass reads the frames and produces a frozen set of scene facts. The four style passes then rewrite those same frozen facts, each in its own voice. Because all four captions are built from one shared visual read, they cannot contradict each other, and a joke can only reframe a real detail, never invent one.
 
-</div>
+## How it works (pipeline)
 
-A caption that reads great can still be **wrong**, and the funnier it is, the more likely it
-is lying. The leaderboard scores **accuracy AND tone**, so a sarcastic line that inverts what
-happened, or a "tech" joke that invents packets and uptime, is a *wrong* caption that *sounds*
-right. Most agents caption all four styles in one shot, so a single visual mistake poisons all
-four. **This agent sees the video exactly once, freezes the facts, and only then writes four
-styles off that frozen truth, so tone lives in the framing, never in a fabricated event.**
+The pipeline (`pipeline.py`) turns one clip into `{task_id, captions:{style: text}}` in two stages plus two quality passes.
 
-> *"One Gemma-4 vision pass turns the frames into a verified scene-fact record. Four parallel
-> Gemma-4 text passes rewrite those same frozen facts into four voices, so a joke changes the
-> tone but never invents an event. The grounding-discipline prompts keep even the tech-humor
-> voice mapping its one engineering metaphor onto a real visible detail. And it is built for
-> the latency gate: frames are streamed, not downloaded, so a 97MB 2-minute clip is captioned
-> end-to-end inside the gate every time."*
+**Stage A, see it once.** One Gemma-4-31B vision call runs over about ten sampled frames and returns a grounded scene-fact JSON: subjects (with colors, counts, and distinctive features), actions, setting, any clearly legible on-screen text read verbatim, spatial layout, mood, and an `uncertain` list for anything blurry, distant, tiny, or guessed. Anything not confirmable is pushed into `uncertain` rather than asserted. If the model fails to return parseable JSON, the vision call is regenerated with a stricter instruction (up to three attempts). The resulting facts are then frozen and reused for everything downstream.
 
-The model isn't a swappable wrapper. **Remove Gemma and the agent does nothing**: every scene
-fact and every caption is Gemma-4-31B.
+**Stage B, style it four times.** Four Gemma-4-31B text calls run concurrently, each rewriting the same frozen facts into one requested style. Each caption is pulled out of a strict `<caption>` delimiter and validated (real sentence, no leaked reasoning, no placeholder, sane length); an invalid reply is regenerated with a stricter prompt, up to three attempts.
 
----
+**Self-eval accuracy pass.** One batched Gemma-4-31B call reviews all four captions against the frozen facts and flags any caption that asserts a literal detail not in the facts (jokes, sarcasm, and clearly figurative metaphors are explicitly not flagged). Each flagged style is regenerated, grounded and concurrently.
 
-## Receipts: re-run every one yourself
+**Distinctiveness reranker (no API for detection).** A word-set Jaccard similarity check finds any two captions that are too similar. The similarity detection uses no model call. When a too-similar pair is found, the later-listed caption is regenerated with a Gemma text call that asks for a different vocabulary, so the four voices stay distinct.
 
-> Receipts, not vibes. Everything below is real and reproducible on a clean clone with one key.
+Every requested style is always populated. When a call never returns a valid caption, that style degrades to a grounded per-style fallback built from the frozen facts, never a fragment, a placeholder, or a zero.
 
-| What | The receipt | Re-run it yourself |
-|---|---|---|
-| **The latency gate is beaten by streaming** | The acceptance test captions the real 97MB 2-minute UHD clip end-to-end (frames streamed, not downloaded) and **hard-asserts it finishes < 30s**. It used to download 97MB (20-40s just for that); it now streams in ~10s. | `python pipeline.py` |
-| **Every style is grounded and mutually distinct** | Same run, 5 real clip URLs: asserts every requested style is a valid caption (non-empty, no leaked reasoning, sane length) and that the four are distinct strings. Exits 0 or fails loud. | `python pipeline.py` |
-| **It runs headless in the grader's exact mode** | `docker run` reads `/input/tasks.json`, streams frames from each clip, writes `/output/results.json` in the exact schema. | `docker run --rm -v $PWD/in:/input -v $PWD/out:/output <image>` |
-| **Accuracy is judged, not assumed** | A **cross-family** LLM-judge (Gemini / `gpt-oss:120b`, **never** Gemma judging Gemma) scores accuracy against the actual frames, plus style-match and style separation, per clip. | `python eval.py` |
-| **A deliberately-wrong caption is caught** | The judge scores "A rocket launches into space" against a real clip at **accuracy < 0.30** (asserted), so the harness is calibrated, not a rubber stamp. | `python eval.py` |
+## Model and providers
 
-### The commands a judge runs on a clean clone
+Gemma-4-31B is load-bearing: every scene fact and every caption comes from Gemma-4-31B. There is no second model doing the real work.
 
-```console
-$ git clone <repo> && cd <repo>
-$ pip install -r requirements.txt
+`gemma.py` exposes one interface (`call_vision` / `call_text`) over a pluggable provider chosen by the `PROVIDER` environment variable. The submitted image sets `PROVIDER=fireworks` and calls Gemma-4-31B served on Fireworks AI, a dedicated on-demand deployment reached through an OpenAI-compatible chat completions endpoint that accepts image inputs as base64 data URLs. Two alternate providers are implemented in the same file: Google AI Studio (`google`, its `generateContent` endpoint) and Ollama Cloud (`ollama`, `gemma4:31b-cloud`). The `ollama` provider additionally sends Gemma-4's calibrated sampling values (`top_k=64`, `top_p=0.95`); the shipped Fireworks path does not set those and relies on temperature alone. All providers that support it use Gemma-4's native `system` role for the persistent grounding rules; the Google path folds those rules into the prompt text because its Gemma endpoint rejects a system instruction.
 
-# (1) the acceptance test: 5 real clips streamed end-to-end,
-#     97MB clip hard-asserted < 30s, every style valid + distinct, exit 0
-$ OLLAMA_API_KEY=... python pipeline.py
+## Frame sampling
 
-# (2) the cross-family eval: accuracy (sees the frames) + style + separation
-$ OLLAMA_API_KEY=... python eval.py
+`frames.py` turns a clip into base64 JPEG frames with ffmpeg (the system binary when present, otherwise the bundled `imageio-ffmpeg` binary, so a missing system install never blocks the run).
+
+Each clip is downloaded once, in full, to a temporary file with a browser `User-Agent` header (some CDNs reject the default Python user agent), and then ffmpeg seeks the local file. This is a full download followed by local seeking, not streaming.
+
+The extractor pulls about ten frames at timestamps that form a superset of the leaderboard judge's six accuracy sample points at `dur*(j+0.5)/6`. Those six midpoints are kept unconditionally; a few start, end, and gap-filler frames are added around them and dropped only if they land within half a second of a kept stamp. Because our sample set is a superset of the judge's, our evidence is always at least what the judge sees. Frames are scaled to 768px on the long side with the aspect ratio preserved (never squished) and encoded at JPEG quality 3, so each frame stays small and the batch stays well under the per-call size cap. A timestamp ffmpeg cannot seek is skipped rather than failing the whole clip.
+
+## Robustness
+
+The agent (`agent.py`) is built to always leave a complete, valid `/output/results.json` on disk.
+
+- **Pre-seeded output.** Before any model call, `results.json` is written with a complete grounded fallback entry for every task. Each clip then atomically upgrades its own entry as it finishes, under a lock, writing to a temp file and `os.replace`-ing it into place. A complete file is on disk from the first write, so a kill, timeout, or hang mid-run can never leave "no output" (which would score zero).
+- **Time-budget guard.** A global elapsed-time check stops starting new clips once the budget is spent (default 500 seconds, leaving tail room under the grader's 600 second cap). A clip that never starts keeps its pre-seeded fallback.
+- **Retry with backoff.** Every provider call goes through a shared wrapper that retries throttling and 5xx responses (408, 409, 425, 429, 500, 502, 503, 504) and network errors with exponential backoff and jitter.
+- **Per-clip concurrency.** Clips are captioned concurrently with a `ThreadPoolExecutor` sized by `MAX_CLIPS` (default 2), so a multi-clip run fits under the cap even when the provider is congested.
+- **One bad clip never sinks the run.** Each task is wrapped in its own try/except that degrades to the grounded fallback for that clip.
+
+## Build
+
+Keys are never committed. Because the grader runs the image headless with no environment flags, the provider key and settings are baked at build time through `--build-arg`:
+
+```
+docker buildx build --platform linux/amd64 \
+  --build-arg PROVIDER=fireworks \
+  --build-arg FIREWORKS_API_KEY=<your_key> \
+  --build-arg FIREWORKS_MODEL=accounts/<acct>/deployments/<id> \
+  --build-arg APP_VERSION=v13 \
+  -t ghcr.io/<you>/gemma-video-captioner:v13 --push .
 ```
 
----
+The `<your_key>`, `<acct>`, and `<id>` above are placeholders. Substitute your own values at build time. No key or token is stored in this repository.
 
-## The inversion: the funniest caption is the easiest one to get wrong
+## Run
 
-The obvious read is *"humor is just a tone; slap it on at the end."* The opposite is true, and it's
-the whole design problem. **Humor and sarcasm are exactly where accuracy dies:** to be funny, a
-model reaches for a metaphor and, if you let it, states the metaphor as fact. "The bear runs its
-fish-catching *algorithm* with zero *dropped packets*" reads great and is **false** (there is no
-algorithm, there are no packets), so an accuracy judge kills it.
-
-So this agent does the opposite of "style last." It **freezes the facts first**, forbids any style
-from asserting a new event, and requires the tech-humor voice to map its single engineering
-metaphor onto a REAL visible detail from the frozen facts (name the actual rally car, the actual
-sunset, the actual kitten), never a literal object or person that isn't there. The framing is
-unmistakably a joke, the literal scene stays true. Example of the target voice: *"Nature's annual
-deployment: all leaf nodes updated to yellow simultaneously, no breaking changes reported."*
-**The style tax is the enemy; the defense is the frozen facts plus the grounding-discipline prompt
-rules, not a post-hoc filter.** The place the naive approach is weakest is the place this design is
-strongest.
-
----
-
-## How it works: see once, style four times
-
-```mermaid
-flowchart LR
-  V["video_url"] -->|"ffmpeg input-seek, streamed (HTTP range)"| F["frames<br/>10, 768px long side<br/>aspect-preserved"]
-  F --> A["STAGE A · Gemma-4 VISION (1 call)<br/>grounded scene-facts JSON + uncertain flags<br/>+ adaptive self-check (only when time is cheap)"]
-  A -->|facts FROZEN| B["STAGE B · Gemma-4 TEXT (4 concurrent calls)<br/>formal · sarcastic · humorous_tech · humorous_non_tech<br/>each rewrites the SAME frozen facts"]
-  B --> O["/output/results.json<br/>{task_id, captions:{style: text}}"]
+```
+docker run --rm -v /abs/in:/input -v /abs/out:/output ghcr.io/<you>/gemma-video-captioner:v13
 ```
 
-1. **Stage A, facts before voice.** ONE Gemma-4 **vision** call turns the frames into a grounded,
-   *specific* scene-facts JSON (subjects with color/count, actions, setting, transcribed on-screen
-   text, notable details, explicit `uncertain` flags). An adaptive self-check then tightens and
-   hedges those facts, but only when the clip is still cheap (elapsed < 14s). On the big clip it is
-   **skipped** to protect the latency gate. The facts are then **frozen**.
-2. **Stage B, four voices, one truth.** Four **text-only** Gemma-4 calls rewrite the *same frozen
-   facts* into the four styles, concurrently. Because they all share one verified fact base, a joke
-   can change the *tone* but never the *events*.
-3. **Built for the latency gate.** Long UHD clips are the trap: a clip that finishes too late is
-   graded as a placeholder. So frames are **streamed** via ffmpeg input-seek and HTTP range
-   requests (a 97MB 2-minute clip costs a few MB and streams in ~10s instead of a 20-40s full
-   download), the self-check is skipped when time is tight, and clips run **concurrently** with a
-   pre-seed so `results.json` is complete on disk before any model call and every clip lands well
-   inside the gate. This is the measured engineering win.
-4. **Robustness.** Gemma-4-31B leaks reasoning or drops the format on some calls, so every parsed
-   output is wrapped in a strict `<json>` / `<caption>` delimiter and **regenerated** when the
-   delimiter is absent, never patched after the fact. Every requested style is **always** populated
-   with a grounded per-style fallback if a call fails (a missing style scores 0), and a global
-   time-budget guard keeps `results.json` complete under the 10-minute cap. Partial-but-complete
-   beats timed-out-and-empty, always.
+The container reads `/input/tasks.json` and writes `/output/results.json`.
 
----
+**Input** is a JSON array of task objects (a top-level `{"tasks":[...]}` wrapper is also accepted):
 
-## It reads the screen (specificity, not vague-but-safe)
-
-The grounding pass is told to be **specific**: name concrete colors, counts, and breeds, and
-**transcribe** any legible on-screen text (signs, scoreboards, jersey/lane numbers, timers,
-watermarks) exactly as shown, or leave it in `uncertain` if it truly can't make it out. That is
-why the acceptance set includes a sports clip with on-screen numbers: a caption that reads the
-scoreboard is specific-and-true, where a generic one is only vague-but-safe.
-
----
-
-## Gemma is load-bearing (the swap test)
-
-Every scene fact and every caption is produced by **Gemma-4-31B**, served via Ollama Cloud
-(`gemma4:31b-cloud`, `think:false` for clean low-latency output). The client is provider-agnostic
-behind `call_vision` / `call_text` (`PROVIDER=google` runs the identical pipeline on the AI Studio
-API), but the *model* is Gemma, deliberately: the "$3k Best Use of Gemma in Video Captioning"
-challenge is the target, and removing Gemma removes the product. This is not a wrapper that could
-run any VLM; the two-stage grounding and the style discipline are built around Gemma-4's multimodal
-grounding.
-
----
-
-## Run it
-
-```bash
-pip install -r requirements.txt
-
-# local: key via env, nothing baked
-OLLAMA_API_KEY=... PROVIDER=ollama python agent.py    # INPUT_DIR/OUTPUT_DIR override /input,/output
-
-# container (how the grader runs it, headless)
-docker run --rm -v /path/in:/input -v /path/out:/output <image>
-#   reads  /input/tasks.json  = [{"task_id","video_url","styles":[...]}]
-#   writes /output/results.json = [{"task_id","captions":{"<style>":"..."}}]
+```json
+[
+  {
+    "task_id": "clip_001",
+    "video_url": "https://example.com/clip_001.mp4",
+    "styles": ["formal", "sarcastic", "humorous_tech", "humorous_non_tech"]
+  }
+]
 ```
 
----
+**Output** is a JSON array with one entry per task, each carrying exactly that task's requested styles:
 
-## Honest limitations (what we do NOT claim)
+```json
+[
+  {
+    "task_id": "clip_001",
+    "captions": {
+      "formal": "A cyclist rides along a coastal road at sunset.",
+      "sarcastic": "A cyclist braves an entire coastal road at sunset, truly the stuff of legend.",
+      "humorous_tech": "A cyclist ships himself down the coast road at sunset, one smooth deploy per pedal stroke.",
+      "humorous_non_tech": "A cyclist glides down the coast at sunset, pedaling like the ice cream truck is three streets ahead."
+    }
+  }
+]
+```
 
-- **Style separation is an emergent property, not a guaranteed number.** It falls out of four
-  genuinely distinct style prompts, and `eval.py` measures it (hand the judge the four captions
-  unlabeled, it re-assigns them). We report whatever it comes out to on a given run to guide tuning;
-  we do **not** claim a fixed separation score.
-- **The local eval is a proxy, not the leaderboard judge.** `eval.py` uses a cross-family judge
-  (Gemini / `gpt-oss:120b`) to *guide tuning*; the real Track-2 judge is different and unseen. We
-  report the proxy honestly and treat the live leaderboard score as ground truth.
-- **The sustainable accuracy judge (`gemma3:27b`) reads optimistically.** It's Gemma-*3* (a
-  different generation from the Gemma-*4* captioner, so low self-bias), but a fully cross-family
-  Gemini reading runs stricter. We anchor to the stricter number where we have it.
-- **Accuracy on humor is the hard seam,** by design (see the inversion). It's the axis we tune
-  hardest and the one we're most honest about.
-- **We do not overfit to specific clips.** Prompts are generic; the eval set spans varied content
-  (nature, sports, people, food, urban, night, static) so the agent generalizes to the hidden set.
+## Team
 
----
-
-## What's in the box
-
-| File | Role |
-|---|---|
-| `agent.py` | entrypoint: `/input/tasks.json` to `/output/results.json`; clips captioned concurrently (pool of 2, env-overridable) with a pre-seed-and-upgrade write, per-task grounded fallback, global time budget |
-| `pipeline.py` | the 2-stage pipeline: grounded vision facts + adaptive self-check, frozen, then 4 concurrent styled captions; delimiter-robust with a grounded per-style fallback |
-| `prompts.py` | Stage-A grounding (specificity + on-screen-text transcription), the self-check, and the 4 style templates with the grounding-discipline block |
-| `gemma.py` | Gemma-4 client (Ollama Cloud / AI Studio), retry+backoff |
-| `frames.py` | video to 10 streamed frames (ffmpeg input-seek + HTTP range, concurrent), 768px long side, aspect-preserved; falls back to a single download only if a host lacks range support |
-| `eval.py` | local cross-family LLM-judge harness (accuracy sees the frames + style + separation), self-calibrating |
-| `Dockerfile` | linux/amd64, ffmpeg, < 1 GB |
-
----
-
-## License
-
-**MIT**, see [LICENSE](./LICENSE). Team **tripod** · AMD Developer Hackathon (ACT II) · Track 2.
+Team tripod. AMD Developer Hackathon (ACT II), Track 2, Google Gemma prize.

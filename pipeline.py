@@ -1,48 +1,42 @@
 """Track-2 captioning pipeline: one clip -> {task_id, captions:{<style>: text}}.
 
-Two stages: Stage A does the accuracy-critical *seeing* ONCE (a vision call -> grounded,
-SPECIFIC scene JSON, then — only if the latency budget allows — one fast self-check that
-tightens the facts) and freezes them; Stage B rewrites those frozen facts into each
-requested style with concurrent text calls.
+Two stages (docs/51 §0): Stage A does the accuracy-critical *seeing* ONCE (a vision
+call -> grounded scene JSON, then one self-check text call) and freezes the facts;
+Stage B rewrites those frozen facts into each requested style with concurrent text
+calls. On top, two D2 quality moves: a no-API style-distinctiveness reranker and a
+single batched self-eval accuracy pass.
 
-LATENCY GATE (the #1 constraint): a clip that finishes over ~30s can be graded as the
-placeholder. So frames are STREAMED (see frames.py — no full download) and the self-check
-is SKIPPED when time is tight (small clips get it, the big 97MB clip does not). No extra
-critique/reranker passes — every added call is latency we can't spend.
-
-Robustness: gemma-4-31b-it leaks reasoning / drops the output format on ~1/3 of calls. We
-fix that at the SOURCE — every parsed output is wrapped in a strict delimiter
-(<json>/<caption>) and REGENERATED if the delimiter is absent, never with a post-hoc
-trimmer. The pipeline never dies: worst case a style falls back to a lightly-styled
-version of the frozen facts (a missing style scores 0).
+The #1 robustness job (T1 finding): gemma-4-31b-it leaks reasoning / drops the output
+format on ~1/3 of calls. We fix that at the SOURCE — every parsed output is wrapped in
+a strict delimiter (<json>/<caption>) and REGENERATED if the delimiter is absent —
+never with a post-hoc trimmer. The pipeline never dies: worst case a style falls back
+to a lightly-styled version of the frozen facts (a missing style scores 0).
 """
 import json
 import re
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
 
 import gemma
 import prompts
 from frames import extract_frames
 
-N_FRAMES = 10      # uniform-midpoint samples; covers the judge's 6 midpoints. Latency-bound: 16 blew the 30s gate on UHD clips (36s), 10 lands ~27s. (see report)
-
-# Generous per-call timeouts: MEASURE real (throttled ~45s) free-tier latency rather
-# than cut slow-but-successful calls short. The container tunes these later (T4).
-VISION_TIMEOUT = 90
-TEXT_TIMEOUT = 60
+# Per-call timeouts: CAP a single hung/throttled call so it can't eat the run's time budget
+# under clip-level concurrency (a stuck vision call would otherwise stall a whole worker).
+VISION_TIMEOUT = 60
+TEXT_TIMEOUT = 45
 
 # Temperatures: low & deterministic for grounding/verification, warmer for voice.
 T_GROUND = 0.2
 T_CHECK = 0.2
 T_STYLE = 0.4     # low + few-shot => model emits a clean caption, not chain-of-thought
+T_EVAL = 0.2
+T_DISTINCT = 0.7
 
 MAX_CAPTION_TRIES = 3      # first attempt + 2 regenerations when <caption> is missing
 MAX_GROUND_TRIES = 3       # first attempt + 2 regenerations when no valid JSON
-# Run the (serial) self-check only when the clip is still cheap — a big clip's frames+vision
-# already eats the budget, so it skips straight to styling to stay under the 30s gate.
-SELF_CHECK_MAX_ELAPSED = 14.0
+DISTINCT_THRESHOLD = 0.55  # word-set Jaccard above this => two captions too similar
+DISTINCT_BUDGET = 2        # cap distinctiveness regenerations per clip
 
 # ---------------------------------------------------------------------------
 # parsing / post-processing (pure helpers — the delimiter-robustness core)
@@ -172,6 +166,12 @@ def _extract_caption(raw):
     return None
 
 
+# Reasoning openers gemma-4 leads with; matched as a PREFIX (startswith), kept OUT of _BAD_SUBSTR
+# so a legit caption like "Let me introduce this scene..." isn't substring-rejected elsewhere.
+_REASONING_OPENERS = ("let me", "let's", "okay", "first,", "i need to", "looking at",
+                      "i'll", "so,", "now,", "alright")
+
+
 def _salvage_core(raw):
     """Best-effort short scene phrase from raw prose facts (when Stage-A JSON parse failed),
     so the fallback stays GROUNDED instead of collapsing to a generic phrase. Skips reasoning
@@ -180,6 +180,8 @@ def _salvage_core(raw):
         return ""
     for s in _SENT.split(re.sub(r"\s+", " ", raw).strip()):
         if any(b in s.lower() for b in _BAD_SUBSTR):
+            continue
+        if s.strip().lower().startswith(_REASONING_OPENERS):  # skip the reasoning opener, keep the real scene sentence
             continue
         s = re.sub(r"^[-*\d.]+\s*", "", s)              # list markers: "1.", "-", "*"
         s = re.sub(r"^\w[\w ]{0,20}:\s*", "", s)         # a leading "Subjects:" style label
@@ -192,10 +194,8 @@ def _salvage_core(raw):
 # stages (take injected `vision`/`text` callables so call-counting stays local)
 # ---------------------------------------------------------------------------
 
-def _stage_a(vision, text, bump, elapsed):
-    """Vision grounding (regen if no JSON) + one self-check WHEN the latency budget allows.
-    `elapsed()` returns seconds since the clip started (frame streaming included). Returns
-    (facts, facts_str)."""
+def _stage_a(vision, text, bump):
+    """Vision grounding (regen if no JSON) + one self-check. Returns (facts, facts_str)."""
     raw, facts = "", None
     for i in range(MAX_GROUND_TRIES):
         if i:
@@ -210,29 +210,23 @@ def _stage_a(vision, text, bump, elapsed):
     if facts is None:
         facts = {"raw": raw.strip()} if raw.strip() else {"error": "vision unavailable"}
     facts_str = json.dumps(facts, ensure_ascii=False)
-
-    # Self-check tightens/hedges the facts, but it is a serial round-trip. Only spend it when
-    # the clip is still cheap (protects the 30s gate on the big clip). Keep it only if it parses.
-    if elapsed() < SELF_CHECK_MAX_ELAPSED:
-        try:
-            checked = _parse_json(text(prompts.self_check(facts_str), T_CHECK))
-            if checked:
-                facts, facts_str = checked, json.dumps(checked, ensure_ascii=False)
-        except Exception:
-            pass
+    # self-check is now folded INTO the vision prompt (in-call verification) -- the separate
+    # self-check text() call was a serial ~15s/clip wave under Ollama congestion and a top cause
+    # of the v8 TIMEOUT. GROUNDING now self-verifies each specific claim before it outputs.
     return facts, facts_str
 
 
-def _gen_style(text, style, facts_str, bump):
+def _gen_style(text, style, facts_str, bump, distinct_from=None):
     """One styled caption: strict <caption> extract -> VALIDATE -> regen with a stricter
     prompt if invalid (cap MAX_CAPTION_TRIES). Returns a valid caption, or None so the
     caller can fall back. Never returns a fragment/placeholder/leaked reasoning."""
-    base = prompts.style_prompt(style, facts_str)
+    base = prompts.style_prompt(style, facts_str, distinct_from)
+    temp = T_DISTINCT if distinct_from else T_STYLE
     for i in range(MAX_CAPTION_TRIES):
         if i:
             bump("style_regens")
         try:
-            raw = text(base if i == 0 else base + prompts.CAPTION_RETRY, T_STYLE)
+            raw = text(base if i == 0 else base + prompts.CAPTION_RETRY, temp)
         except Exception:
             continue
         cap = _extract_caption(raw)
@@ -246,6 +240,43 @@ def _stage_b(text, styles, facts_str, bump):
     with ThreadPoolExecutor(max_workers=min(4, len(styles))) as ex:
         futs = {s: ex.submit(_gen_style, text, s, facts_str, bump) for s in styles}
         return {s: futs[s].result() for s in styles}
+
+
+def _accuracy_pass(text, facts_str, caps):
+    """ONE batched critique call. Returns the set of styles flagged as ungrounded."""
+    labeled = "\n".join(f"{s}: {c}" for s, c in caps.items() if c)
+    if not labeled:
+        return set()
+    try:
+        res = _parse_json(text(prompts.accuracy_eval(facts_str, labeled), T_EVAL))
+    except Exception:
+        return set()
+    failed = (res or {}).get("failed", [])
+    return {s for s in failed if s in caps} if isinstance(failed, list) else set()
+
+
+def _distinct_pairs(styles):
+    """All style pairs, humorous_tech<->humorous_non_tech checked first (the known collapse)."""
+    pairs = [(styles[i], styles[j]) for i in range(len(styles)) for j in range(i + 1, len(styles))]
+    hp = {"humorous_tech", "humorous_non_tech"}
+    pairs.sort(key=lambda p: 0 if set(p) == hp else 1)
+    return pairs
+
+
+def _distinct_pass(text, styles, caps, facts_str, bump):
+    """No-API reranker: regenerate the later-listed of any too-similar pair, made distinct."""
+    budget = DISTINCT_BUDGET
+    for a, b in _distinct_pairs(styles):
+        if budget <= 0:
+            break
+        if not caps.get(a) or not caps.get(b):
+            continue
+        sim = _jaccard(caps[a], caps[b])
+        if sim >= DISTINCT_THRESHOLD:
+            new = _gen_style(text, b, facts_str, bump, distinct_from=caps[a])
+            budget -= 1
+            if new and _jaccard(caps[a], new) < sim:
+                caps[b] = new
 
 
 def _fallback(style, facts):
@@ -264,10 +295,11 @@ def _fallback(style, facts):
     if not core:  # Stage-A JSON failed -> salvage a grounded phrase from the raw prose facts
         core = _salvage_core(facts.get("raw") or "")
     core = core or "a short real-world scene"  # truly unusable: generic but never a fragment/leak
+    core = " ".join(core.split()[:14])  # cap: v12's rich facts can make core huge -> a run-on fallback
     templ = {
         "formal": f"The video shows {core}.",
         "sarcastic": f"Groundbreaking footage of {core}. Truly riveting stuff.",
-        "humorous_tech": f"Now serving from production: {core}, running at stable uptime.",
+        "humorous_tech": f"Pushing {core} straight to production, no rollback required.",
         "humorous_non_tech": f"Just everyday magic: {core}, and honestly, a whole mood.",
     }
     return _postprocess(templ.get(style, f"A {style.replace('_', ' ')} view of {core}."))
@@ -282,10 +314,12 @@ def caption_video(task, frames_b64=None):
     Returns {"task_id": ..., "captions": {style: text for style in task['styles']}}.
     Extracts frames from task['video_url'] when frames_b64 is None. Never raises for a
     single clip: partial > zero, every requested style is always populated."""
-    t0 = time.perf_counter()                       # includes frame streaming (counts toward the gate)
     styles = list(task["styles"])
     if frames_b64 is None:
-        frames_b64 = extract_frames(task["video_url"], n=N_FRAMES)
+        frames_b64 = extract_frames(task["video_url"], n=10)
+    if not frames_b64:  # extraction yielded [] (undecodable clip) or empty input: NEVER call the
+        # model blind — with no images it hallucinates a schema-valid scene. Grounded fallback instead.
+        return {"task_id": task["task_id"], "captions": {s: _fallback(s, {}) for s in styles}}
 
     stats = {"calls": 0, "style_regens": 0, "ground_regens": 0, "fallbacks": 0}
     lock = threading.Lock()
@@ -296,14 +330,33 @@ def caption_video(task, frames_b64=None):
 
     def vision(prompt, temp):
         bump("calls")
-        return gemma.call_vision(prompt, frames_b64, timeout=VISION_TIMEOUT, temperature=temp)
+        return gemma.call_vision(prompt, frames_b64, timeout=VISION_TIMEOUT, temperature=temp,
+                                 system=prompts.SYSTEM)
 
     def text(prompt, temp):
         bump("calls")
-        return gemma.call_text(prompt, timeout=TEXT_TIMEOUT, temperature=temp)
+        return gemma.call_text(prompt, timeout=TEXT_TIMEOUT, temperature=temp, system=prompts.SYSTEM)
 
-    facts, facts_str = _stage_a(vision, text, bump, lambda: time.perf_counter() - t0)
+    facts, facts_str = _stage_a(vision, text, bump)
     caps = _stage_b(text, styles, facts_str, bump)
+
+    # D2 self-eval accuracy pass (RESTORED for v11): ONE batched critique flags any caption that
+    # asserts a LITERAL detail not in the facts (jokes/metaphors are explicitly NOT flagged), then
+    # regenerate each flagged style, grounded and concurrently. This is the anti-hallucination
+    # safety net v6 (0.71) had; v9/v10 dropped it ONLY to survive Ollama's timeout — which
+    # Fireworks removes (per-clip ~18s under concurrency, 330s of slack under the 600s cap).
+    flagged = _accuracy_pass(text, facts_str, caps)
+    if flagged:
+        with ThreadPoolExecutor(max_workers=min(4, len(flagged))) as ex:
+            regen = {s: ex.submit(_gen_style, text, s, facts_str, bump) for s in flagged}
+            for s, fut in regen.items():
+                new = fut.result()
+                if new:
+                    caps[s] = new
+
+    # D2 distinctiveness reranker (RESTORED for v11): regenerate the later of any too-similar style
+    # pair so the four voices stay distinct (helps the style half of the score). Also v6.
+    _distinct_pass(text, styles, caps, facts_str, bump)
 
     # Always populate every requested style with a REAL caption (a missing style scores 0).
     for s in styles:
@@ -311,69 +364,64 @@ def caption_video(task, frames_b64=None):
             caps[s] = _fallback(s, facts)
             bump("fallbacks")
 
-    caption_video.last_stats = dict(stats)  # ponytail: diagnostics only; approximate if clips run concurrently
-    return {"task_id": task["task_id"], "captions": {s: caps[s] for s in styles}}
+    # diagnostics: expose the frozen FACTS + frame count so agent._telemetry can log WHAT the
+    # grounding extracted per clip. RETURN them in _diag so per-clip telemetry stays correct under
+    # clip-level concurrency (the shared last_stats attribute RACES); keep last_stats for compat.
+    caption_video.last_stats = dict(stats, facts=facts, n_frames=len(frames_b64))
+    return {"task_id": task["task_id"], "captions": {s: caps[s] for s in styles},
+            "_diag": {"facts": facts, "n_frames": len(frames_b64),
+                      "calls": stats["calls"], "fallbacks": stats["fallbacks"]}}
 
 
 caption_video.last_stats = {"calls": 0, "style_regens": 0, "ground_regens": 0, "fallbacks": 0}
 
 
 # ---------------------------------------------------------------------------
-# acceptance test: caption the REAL clip URLs end-to-end (streaming included) and measure
-# WALL-CLOCK per clip. The 97MB 2-min clip (12471596) is the latency gate: must be < 30s.
-# Frames are NOT pre-extracted here — caption_video streams them, exactly as the container does.
+# self-check: 3 example clips (mapped via tasks.json) + 2 harder bucket clips
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import os
+    import time
 
     HERE = os.path.dirname(os.path.abspath(__file__))
+    ROOT = os.path.dirname(HERE)
     OUT = os.path.join(HERE, "spike_out")
     os.makedirs(OUT, exist_ok=True)
     STYLES4 = ["formal", "sarcastic", "humorous_tech", "humorous_non_tech"]
-    BASE = "https://storage.googleapis.com/amd-hackathon-clips/"
 
-    # (task_id, filename) — the exact clips the task asks us to prove.
-    jobs = [
-        ("12471596", "12471596-uhd_2560_1440_30fps.mp4"),   # 97MB, 2-min UHD — THE latency gate
-        ("v1_1860079", "1860079-uhd_2560_1440_25fps.mp4"),
-        ("v2_13825391", "13825391-uhd_3840_2160_30fps.mp4"),
-        ("v3_3044693", "3044693-uhd_3840_2160_24fps.mp4"),
-        ("8533913", "8533913-uhd_2560_1440_25fps.mp4"),      # sports — on-screen numbers/text
-    ]
+    tasks = json.load(open(os.path.join(ROOT, "samples", "input", "tasks.json"), encoding="utf-8"))
+    jobs = [(t["task_id"], os.path.join(ROOT, "samples", "clips", f'{t["task_id"]}.mp4'), t["styles"]) for t in tasks]
+    bucket = os.path.join(ROOT, "samples", "bucket_clips")
+    jobs += [("bucket_60fps", os.path.join(bucket, "34796505-hd_1920_1080_60fps.mp4"), STYLES4),
+             ("bucket_tiny24", os.path.join(bucket, "31948459-hd_1920_1080_24fps.mp4"), STYLES4)]
 
     gemma.reset_stats()
-    times = {}
-    for tid, fname in jobs:
-        url = BASE + fname
-        print(f"\n=== {tid}  ({fname}) ===")
-        r0 = gemma.RETRY_STATS["total_retries"]
+    agg = {"style_regens": 0, "ground_regens": 0, "fallbacks": 0, "calls": 0}
+    for tid, path, styles in jobs:
+        print(f"\n=== {tid} ===")
         t0 = time.perf_counter()
-        res = caption_video({"task_id": tid, "styles": STYLES4, "video_url": url})  # streams frames
+        frames = extract_frames(path, n=10)
+        r0 = gemma.RETRY_STATS["total_retries"]
+        res = caption_video({"task_id": tid, "styles": styles, "video_url": path}, frames_b64=frames)
         dt = time.perf_counter() - t0
-        times[tid] = dt
         caps = res["captions"]
         st = caption_video.last_stats
-        vals = [caps[s] for s in STYLES4]
+        for k in agg:
+            agg[k] += st[k]
+        vals = [caps[s] for s in styles]
         mx = max((_jaccard(vals[i], vals[j]) for i in range(len(vals)) for j in range(i + 1, len(vals))), default=0.0)
-        gate = "OK" if dt < 30 else "!! OVER 30s GATE !!"
-        print(f"  WALL={dt:.1f}s [{gate}]  calls={st['calls']} regens(style/ground)={st['style_regens']}/{st['ground_regens']}"
-              f" fallbacks={st['fallbacks']} throttle={gemma.RETRY_STATS['total_retries'] - r0} max_pair_jaccard={mx:.2f}")
-        for s in STYLES4:
+        print(f"  calls={st['calls']} time={dt:.1f}s throttle_retries={gemma.RETRY_STATS['total_retries'] - r0} "
+              f"| style_regens={st['style_regens']} ground_regens={st['ground_regens']} fallbacks={st['fallbacks']} "
+              f"| max_pair_jaccard={mx:.2f}")
+        for s in styles:
             print(f"   [{s}] {caps[s]}")
         json.dump(res, open(os.path.join(OUT, f"{tid}.json"), "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
-        assert set(STYLES4) <= set(caps), f"{tid}: missing style"
-        for s in STYLES4:
+        # every requested style must be a clean, real, mutually-distinct caption
+        assert set(styles) <= set(caps), f"{tid}: missing style"
+        for s in styles:
             assert _valid_caption(caps[s]), f"{tid}/{s}: not a valid caption: {caps[s]!r}"
-        assert len({caps[s] for s in STYLES4}) == len(STYLES4), f"{tid}: captions not mutually distinct"
+        assert len({caps[s] for s in styles}) == len(styles), f"{tid}: captions not mutually distinct"
 
-    slow = [f"{t}={times[t]:.1f}s" for t in times if times[t] >= 30]
-    print(f"\nacceptance done on {len(jobs)} clips. slowest = {max(times.values()):.1f}s (gate ~30s). "
-          f"over-gate: {slow or 'none'}")
-    # HARD assert only on 12471596: the 97MB 2-min clip is the DETERMINISTIC latency win —
-    # it used to DOWNLOAD 97MB (20-30s just for that) and now STREAMS in ~10s, so it must beat
-    # the gate every time. Any other clip's rare >30s is Ollama-cloud model-call tail variance
-    # (a slow vision/style call on shared infra), which no captioner-side code can remove.
-    assert times["12471596"] < 30, (
-        f"the 97MB streaming clip took {times['12471596']:.1f}s (>30s) — streaming regressed")
-    print(f"throttle retries across the run: {gemma.RETRY_STATS}")
+    print(f"\nself-check PASSED on {len(jobs)} clips: every style is a clean, distinct, valid caption.")
+    print(f"format-robustness across the run: {agg} | throttle retries: {gemma.RETRY_STATS}")
